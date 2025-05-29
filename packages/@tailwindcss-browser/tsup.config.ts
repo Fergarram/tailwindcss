@@ -1,7 +1,7 @@
 import { defineConfig } from 'tsup'
 
 export default defineConfig({
-  format: ['iife'],
+  format: ['esm'],
   clean: true,
   minify: true,
   entry: ['src/index.ts'],

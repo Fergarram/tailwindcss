@@ -2,100 +2,39 @@ import * as tailwindcss from 'tailwindcss'
 import * as assets from './assets'
 import { Instrumentation } from './instrumentation'
 
-// Warn users about using the browser build in production as early as possible.
-// It can take time for the script to do its work so this must be at the top.
-console.warn(
-  'The browser build of Tailwind CSS should not be used in production. To use Tailwind CSS in production, use the Tailwind CLI, Vite plugin, or PostCSS plugin: https://tailwindcss.com/docs/installation',
-)
-
-/**
- * The type used by `<style>` tags that contain input CSS.
- */
-const STYLE_TYPE = 'text/tailwindcss'
-
 /**
  * The current Tailwind CSS compiler.
- *
- * This gets recreated:
- * - When stylesheets change
  */
 let compiler: Awaited<ReturnType<typeof tailwindcss.compile>>
 
 /**
- * The list of all seen classes on the page so far. The compiler already has a
- * cache of classes but this lets us only pass new classes to `build(…)`.
+ * Registry of all processed classes
  */
-let classes = new Set<string>()
-
-/**
- * The last input CSS that was compiled. If stylesheets "change" without
- * actually changing, we can avoid a full rebuild.
- */
-let lastCss = ''
+const processedClasses = new Set<string>()
 
 /**
  * The stylesheet that we use to inject the compiled CSS into the page.
  */
-let sheet = document.createElement('style')
+let sheet: HTMLStyleElement
 
 /**
- * The queue of build tasks that need to be run. This is used to ensure that we
- * don't run multiple builds concurrently.
+ * The queue of build tasks that need to be run
  */
 let buildQueue = Promise.resolve()
 
 /**
- * What build this is
+ * Used for instrumenting the build process
  */
-let nextBuildId = 1
+const I = new Instrumentation()
 
 /**
- * Used for instrumenting the build process. This data shows up in the
- * performance tab of the browser's devtools.
+ * Create the Tailwind CSS compiler with custom or default styles
  */
-let I = new Instrumentation()
+export async function initializeCompiler(customCss?: string) {
+  I.start(`Initialize compiler`)
 
-/**
- * Create the Tailwind CSS compiler
- *
- * This handles loading imports, plugins, configs, etc…
- *
- * This does **not** imply that the CSS is actually built. That happens in the
- * `build` function and is a separate scheduled task.
- */
-async function createCompiler() {
-  I.start(`Create compiler`)
-  I.start('Reading Stylesheets')
-
-  // The stylesheets may have changed causing a full rebuild so we'll need to
-  // gather the latest list of stylesheets.
-  let stylesheets: Iterable<HTMLStyleElement> = document.querySelectorAll(
-    `style[type="${STYLE_TYPE}"]`,
-  )
-
-  let css = ''
-  for (let sheet of stylesheets) {
-    observeSheet(sheet)
-    css += sheet.textContent + '\n'
-  }
-
-  // The user might have no stylesheets, or a some stylesheets without `@import`
-  // because they want to customize their theme so we'll inject the main import
-  // for them. However, if they start using `@import` we'll let them control
-  // the build completely.
-  if (!css.includes('@import')) {
-    css = `@import "tailwindcss";${css}`
-  }
-
-  I.end('Reading Stylesheets', {
-    size: css.length,
-    changed: lastCss !== css,
-  })
-
-  // The input CSS did not change so the compiler does not need to be recreated
-  if (lastCss === css) return
-
-  lastCss = css
+  // Default CSS with Tailwind imports, or use custom CSS if provided
+  const css = customCss ?? `@import "tailwindcss";`
 
   I.start('Compile CSS')
   try {
@@ -104,12 +43,16 @@ async function createCompiler() {
       loadStylesheet,
       loadModule,
     })
+
+    // Create and append stylesheet if it doesn't exist
+    if (!sheet) {
+      sheet = document.createElement('style')
+      document.head.append(sheet)
+    }
   } finally {
     I.end('Compile CSS')
-    I.end(`Create compiler`)
+    I.end(`Initialize compiler`)
   }
-
-  classes.clear()
 }
 
 async function loadStylesheet(id: string, base: string) {
@@ -156,22 +99,15 @@ async function loadStylesheet(id: string, base: string) {
   }
 
   try {
-    let sheet = load()
-
-    I.hit(`Loaded stylesheet`, {
-      id,
-      base,
-      size: sheet.content.length,
-    })
-
-    return sheet
+    let stylesheet = load()
+    I.hit(`Loaded stylesheet`, { id, base, size: stylesheet.content.length })
+    return stylesheet
   } catch (err) {
     I.hit(`Failed to load stylesheet`, {
       id,
       base,
       error: (err as Error).message ?? err,
     })
-
     throw err
   }
 }
@@ -180,121 +116,96 @@ async function loadModule(): Promise<never> {
   throw new Error(`The browser build does not support plugins or config files.`)
 }
 
-async function build(kind: 'full' | 'incremental') {
-  if (!compiler) return
-
-  // 1. Refresh the known list of classes
-  let newClasses = new Set<string>()
-
-  I.start(`Collect classes`)
-
-  for (let element of document.querySelectorAll('[class]')) {
-    for (let c of element.classList) {
-      if (classes.has(c)) continue
-
-      classes.add(c)
-      newClasses.add(c)
-    }
+/**
+ * Process and compile CSS for the given classes
+ */
+async function processClasses(classNames: string[]) {
+  if (!compiler) {
+    await initializeCompiler()
   }
 
-  I.end(`Collect classes`, {
-    count: newClasses.size,
-  })
+  // Filter out classes that have already been processed
+  const newClasses = classNames.filter((cls) => !processedClasses.has(cls))
 
-  if (newClasses.size === 0 && kind === 'incremental') return
+  if (newClasses.length === 0) return
 
-  // 2. Compile the CSS
-  I.start(`Build utilities`)
+  I.start(`Process new classes`)
 
-  sheet.textContent = compiler.build(Array.from(newClasses))
+  // Add new classes to the registry
+  for (const cls of newClasses) {
+    processedClasses.add(cls)
+  }
 
-  I.end(`Build utilities`)
+  // Build CSS for ALL processed classes to avoid duplication
+  const allProcessedClasses = Array.from(processedClasses)
+  const compiledCss = compiler.build(allProcessedClasses)
+
+  // Replace the stylesheet content rather than appending
+  sheet.textContent = compiledCss
+
+  I.end(`Process new classes`, { count: newClasses.length, total: allProcessedClasses.length })
 }
 
-function rebuild(kind: 'full' | 'incremental') {
-  async function run() {
-    if (!compiler && kind !== 'full') {
-      return
-    }
-
-    let buildId = nextBuildId++
-
-    I.start(`Build #${buildId} (${kind})`)
-
-    if (kind === 'full') {
-      await createCompiler()
-    }
-
-    I.start(`Build`)
-    await build(kind)
-    I.end(`Build`)
-
-    I.end(`Build #${buildId} (${kind})`)
-  }
-
-  buildQueue = buildQueue.then(run).catch((err) => I.error(err))
+/**
+ * Queue processing of classes
+ */
+function queueClassProcessing(classNames: string[]) {
+  buildQueue = buildQueue.then(() => processClasses(classNames)).catch((err) => I.error(err))
 }
 
-// Handle changes to known stylesheets
-let styleObserver = new MutationObserver(() => rebuild('full'))
-
-function observeSheet(sheet: HTMLStyleElement) {
-  styleObserver.observe(sheet, {
-    attributes: true,
-    attributeFilter: ['type'],
-    characterData: true,
-    subtree: true,
-    childList: true,
-  })
+/**
+ * Parse a string of classes into an array of individual class names
+ */
+function parseClassString(input: string): string[] {
+  return input.trim().split(/\s+/).filter(Boolean)
 }
 
-// Handle changes to the document that could affect the styles
-// - Changes to any element's class attribute
-// - New stylesheets being added to the page
-// - New elements (with classes) being added to the page
-new MutationObserver((records) => {
-  let full = 0
-  let incremental = 0
+/**
+ * Combines multiple class values into a single string.
+ * Accepts strings, objects where keys are class names and values are booleans,
+ * and falsy values which are ignored.
+ *
+ * @example
+ * tw(
+ *   "p-5 text-white bg-black", // Always included
+ *   isActive && "underline",   // Conditionally included based on truthiness
+ *   {
+ *     "font-bold": isBold,     // Included if isBold is true
+ *     "italic": !isBold        // Included if isBold is false
+ *   }
+ * )
+ */
+export function tw(
+  ...inputs: (string | boolean | null | undefined | { [key: string]: boolean })[]
+): string {
+  const resultClasses: string[] = []
+  const allClassesToProcess: string[] = []
 
-  for (let record of records) {
-    // New stylesheets == tracking + full rebuild
-    for (let node of record.addedNodes as Iterable<HTMLElement>) {
-      if (node.nodeType !== Node.ELEMENT_NODE) continue
-      if (node.tagName !== 'STYLE') continue
-      if (node.getAttribute('type') !== STYLE_TYPE) continue
+  for (const input of inputs) {
+    if (!input) continue // Skip falsy values (false, null, undefined, etc.)
 
-      observeSheet(node as HTMLStyleElement)
-      full++
-    }
+    if (typeof input === 'string') {
+      const parsedClasses = parseClassString(input)
+      resultClasses.push(...parsedClasses)
+      allClassesToProcess.push(...parsedClasses)
+    } else if (typeof input === 'object') {
+      // Handle objects where keys are class names and values are booleans
+      for (const [className, condition] of Object.entries(input)) {
+        // Process the class names for Tailwind, regardless of condition
+        const parsedClasses = parseClassString(className)
+        allClassesToProcess.push(...parsedClasses)
 
-    // New nodes require an incremental rebuild
-    for (let node of record.addedNodes) {
-      if (node.nodeType !== 1) continue
-
-      // Skip the output stylesheet itself to prevent loops
-      if (node === sheet) continue
-
-      incremental++
-    }
-
-    // Changes to class attributes require an incremental rebuild
-    if (record.type === 'attributes') {
-      incremental++
+        // Only include in the result if the condition is true
+        if (condition) {
+          resultClasses.push(...parsedClasses)
+        }
+      }
     }
   }
 
-  if (full > 0) {
-    return rebuild('full')
-  } else if (incremental > 0) {
-    return rebuild('incremental')
-  }
-}).observe(document.documentElement, {
-  attributes: true,
-  attributeFilter: ['class'],
-  childList: true,
-  subtree: true,
-})
+  // Make sure we're processing ALL potential classes
+  queueClassProcessing(allClassesToProcess)
 
-rebuild('full')
-
-document.head.append(sheet)
+  // Return the combined class string of only the active classes
+  return resultClasses.join(' ')
+}
